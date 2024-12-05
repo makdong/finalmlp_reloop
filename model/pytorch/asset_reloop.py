@@ -1,7 +1,14 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from tqdm import tqdm
+from sklearn.metrics import precision_score, recall_score
 
+def f1_score_metric(y_true, y_pred):
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = 2 * (precision * recall) / (precision + recall)
+    return f1
 
 class MLP(nn.Sequential):
     def __init__(self, dim_in, num_hidden, dim_hidden, dim_out=None, batch_norm=True, dropout=0.0):
@@ -102,7 +109,7 @@ class FinalMLP(nn.Module):
         dim_hidden_1=64,
         num_hidden_2=2,
         dim_hidden_2=64,
-        num_heads=1,
+        num_heads=2,
         dropout=0.0,
     ):
         super().__init__()
@@ -152,7 +159,7 @@ class FinalMLP(nn.Module):
         # get interactions from the two branches
         # (bs, dim_hidden_1), (bs, dim_hidden_1)
         latent_1, latent_2 = self.interaction_1(emb_1), self.interaction_2(emb_2)
-
+        
         # merge the representations using an aggregation scheme
         logits = self.aggregation(latent_1, latent_2)  # (bs, 1)
         outputs = F.sigmoid(logits)  # (bs, 1)
@@ -166,6 +173,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+print(device)
 
 class PandasDataset(Dataset):
     def __init__(self, dataframe):
@@ -222,83 +231,149 @@ numeric_features = [
     'totl_pvw_cont_sum', 'inpc_page_knd_cont_sum'
 ]
 
+columns_of_interest = [
+    'rcnt_sub_0', 'rcnt_sub_1', 'rcnt_sub_2', 'rcnt_sub_3', 'rcnt_sub_4',
+    'rcnt_buy_0', 'rcnt_buy_1', 'rcnt_buy_2', 'rcnt_buy_3', 'rcnt_buy_4'
+]
+
+mask = train_data[columns_of_interest].apply(lambda row: row.isin(['PC', 'TV']).any(), axis=1)
+
+data_with_pc_tv = train_data[mask]
+data_without_pc_tv = train_data[~mask]
+
+batch_size = 4096
+
+columns_of_interest = [
+    'rcnt_sub_0', 'rcnt_sub_1', 'rcnt_sub_2', 'rcnt_sub_3', 'rcnt_sub_4',
+    'rcnt_buy_0', 'rcnt_buy_1', 'rcnt_buy_2', 'rcnt_buy_3', 'rcnt_buy_4'
+]
+
+mask = train_data[columns_of_interest].apply(lambda row: row.isin(['PC', 'TV']).any(), axis=1)
+
+data_with_pc_tv = train_data[mask].copy()
+
 # 카테고리형 변수 인코딩
 for feat in categorical_features:
     lbe = LabelEncoder()
-    train_data[feat] = lbe.fit_transform(train_data[feat])
+    data_with_pc_tv[feat] = lbe.fit_transform(data_with_pc_tv[feat])
     test_data[feat] = lbe.fit_transform(test_data[feat])
 
 # 수치형 변수 스케일링
 scaler = StandardScaler()
-train_data[numeric_features] = scaler.fit_transform(train_data[numeric_features])
+data_with_pc_tv[numeric_features] = scaler.fit_transform(data_with_pc_tv[numeric_features])
 test_data[numeric_features] = scaler.fit_transform(test_data[numeric_features])
 
-train_dataset, val_dataset = train_test_split(train_data, test_size=0.2)
-
 # Dataset 객체 생성
-train_dataset = PandasDataset(train_data)
+train_dataset = PandasDataset(data_with_pc_tv)
+test_dataset = PandasDataset(test_data)
 
-batch_size = 2
+batch_size = 4096
+
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size)
-test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 num_features = 32
-num_embedding = 32
+num_embedding = 512
+
+def self_correction_loss(y_true, y_pred, y_last):
+    positive_loss = y_true * torch.clamp(y_last - y_pred, min=0)
+    negative_loss = (1 - y_true) * torch.clamp(y_pred - y_last, min=0)
+    return positive_loss + negative_loss
+
+class ReLoopLoss(nn.Module):
+    def __init__(self, alpha=0.5):
+        super(ReLoopLoss, self).__init__()
+        self.alpha = alpha
+        self.bce_loss = nn.BCELoss()
+
+    def forward(self, y_true, y_pred, y_last):
+        sc_loss = self_correction_loss(y_true, y_pred, y_last)
+        ce_loss = self.bce_loss(y_pred, y_true.float())
+
+        return self.alpha * sc_loss.mean() + (1 - self.alpha) * ce_loss
+    
+criterion = ReLoopLoss(alpha=0.5)
+
+prev_model = FinalMLP(
+   dim_input=num_features,
+   num_embedding=num_embedding,
+   dim_embedding=16,
+   dropout=0.2,
+).to(device)
 
 model = FinalMLP(
    dim_input=num_features,
    num_embedding=num_embedding,
-   dim_embedding=32,
+   dim_embedding=16,
    dropout=0.2,
 ).to(device)
 
-optimizer = optim.Adam(model.parameters(), lr=0.01)
-criterion = nn.BCELoss()
+model.load_state_dict(torch.load('fmlp_reloop.pth'))
+prev_model.load_state_dict(torch.load('fmlp_reloop.pth'))
 
-epochs = 100
+prev_model.eval()
+
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+epochs = 50
+
+def calc_test_loss():
+    y_pred = []
+    prediction_loss = 0.0
+
+    with torch.no_grad():
+        for data, label in test_loader:
+            data, label = data.to(device).long(), label.to(device)
+
+            outputs = model(data).squeeze()
+            prev_outputs = prev_model(data).squeeze()
+
+            loss = criterion(label.float(), outputs, prev_outputs)
+            prediction_loss += loss.item()
+            if device == 'cpu':
+                y_pred.extend(outputs)
+            else:
+                y_pred.extend(outputs.cpu().tolist())
+
+    predicted = [1 if y > 0.5 else 0 for y in y_pred]
+
+    prediction_loss /= len(test_loader)
+    f1 = f1_score_metric(test_data['y'], predicted)
+
+    return prediction_loss, f1
 
 
-for epoch in range(epochs):
+for epoch in tqdm(range(epochs)):
     model.train()
 
     train_loss = 0.0
     for data, label in train_loader:
         data, label = data.to(device).long(), label.to(device)
 
-        print(data.shape)
-
         optimizer.zero_grad()
         outputs = model(data).squeeze()
-        loss = criterion(outputs, label.float())
+        prev_outputs = prev_model(data).squeeze()
+        
+        loss = criterion(label.float(), outputs, prev_outputs)
         loss.backward()
         optimizer.step()
         train_loss += loss.item()
 
-    train_loss /= len(train_loader)
-
     # Validation loop
     model.eval()
-    val_loss = 0.0
-    with torch.no_grad():
-        for data, label in val_loader:
-            data, label = data.to(device), label.to(device)
 
-            
-            outputs = model(data).squeeze()
-            loss = criterion(outputs, label.float())
-            val_loss += loss.item()
+    train_loss /= len(train_loader)
+    prediction_loss, f1_score = calc_test_loss()
 
-    val_loss /= len(val_loader)
-    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Test F1 score : {f1_score}")
 
 # Prediction
 
-model.eval()
-y_pred = []
-with torch.no_grad():
-    for data, label in test_loader:
-        data, label = data.to(device), label.to(device)
+torch.save(model.state_dict(), "reloop_with_pctv.pth")
 
-        outputs = model(data).squeeze()
-        y_pred.extend(outputs.cpu().numpy())
+model.eval()
+prediction_loss, f1_score = calc_test_loss()
+
+print(f"Test Loss: {prediction_loss:.4f}, F1 Score : {f1_score}")
+
+        
