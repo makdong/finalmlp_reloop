@@ -87,8 +87,8 @@ class FindThreshold:
         print(f"Final threshold: {final_threshold} | Final F1 score : {final_f1} | Test F1 score : {test_f1}")
 
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-# find_threshold = FindThreshold(device=device, name="fmlp_without_pctv.pth")
-find_threshold = FindThreshold(device=device, name="reloop_with_pctv.pth")
+find_threshold = FindThreshold(device=device, name="fmlp_without_pctv.pth")
+# find_threshold = FindThreshold(device=device, name="reloop_with_pctv.pth")
 find_threshold.run()
 
         

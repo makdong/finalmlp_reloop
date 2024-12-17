@@ -8,6 +8,15 @@ debug/
 # C extensions
 *.so
 
+# data file
+*.csv
+
+# model
+*.pth
+
+# temporary file for debugging
+temp.ipynb
+
 # Distribution / packaging
 .Python
 build/
